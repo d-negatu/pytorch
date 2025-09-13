@@ -27,16 +27,8 @@ from typing import Any, Callable, NewType, Optional
 from typing_extensions import Never
 
 import torch
-import torch._inductor.package
 from torch._dynamo.exc import PackageError
 from torch._dynamo.graph_utils import _graph_uses_non_cpu
-from torch._dynamo.precompile_context import (
-    PrecompileCacheArtifact,
-    PrecompileContext,
-    SystemInfo,
-)
-from torch._inductor.runtime.cache_dir_utils import cache_dir
-from torch.compiler._cache import CacheArtifactFactory
 
 from .bytecode_transformation import get_code_keys
 from .utils import dynamo_timed, increment_frame
@@ -281,6 +273,8 @@ class _DynamoCacheEntry:
     inlined_sources: set[InlinedSource]
     use_cuda: bool
     system_info: SystemInfo = dataclasses.field(default_factory=SystemInfo.current)
+    fn_name: Optional[str] = None
+    fn_first_lineno: Optional[str] = None
 
     @property
     def backend_ids(self) -> set[_BackendId]:
@@ -291,15 +285,15 @@ class _DynamoCacheEntry:
         current_system_info = SystemInfo.current()
         self.system_info.check_compatibility(current_system_info, self.use_cuda)
 
-
-@CacheArtifactFactory.register
-class _DynamoCacheArtifact(PrecompileCacheArtifact[_DynamoCacheEntry]):
-    @staticmethod
-    def type() -> str:
-        return "precompile_dynamo"
-
-    def after_deserialization(self) -> _DynamoCacheEntry:
-        return pickle.loads(self.content)
+    def debug_info(self) -> dict[str, Any]:
+        assert len(self.codes) > 0
+        return {
+            "num_codes": str(len(self.codes)),
+            "fn_name": self.fn_name,
+            "fn_first_lineno": self.fn_first_lineno,
+            "use_cuda": self.use_cuda,
+            "backend_ids": list(self.backend_ids),
+        }
 
 
 def _hash_source(source: str) -> str:
@@ -676,10 +670,13 @@ class CompilePackage:
 
     def cache_entry(self) -> _DynamoCacheEntry:
         self.validate()
+        assert self._innermost_fn is not None
         return _DynamoCacheEntry(
             codes=list(self._codes.values()),
             inlined_sources=self._inlined_sources,
             use_cuda=self._use_cuda,
+            fn_name=self._innermost_fn.__qualname__,
+            fn_first_lineno=self._innermost_fn.__code__.co_firstlineno,
         )
 
     @staticmethod
@@ -694,17 +691,7 @@ class CompilePackage:
         return sha256_hash.hexdigest()
 
 
-@CacheArtifactFactory.register
-class EagerCacheArtifact(PrecompileCacheArtifact[Any]):
-    @staticmethod
-    def type() -> str:
-        return "precompile_eager"
-
-    def after_deserialization(self) -> Any:
-        return pickle.loads(self.content)
-
-
-_Backends = dict[_BackendId, PrecompileCacheArtifact[Any]]
+_Backends = dict[_BackendId, Any]
 
 
 class DynamoStore(abc.ABC):
@@ -718,16 +705,22 @@ class DynamoStore(abc.ABC):
         """
         Records a package to PrecompileContext, so that it can be serialized later.
         """
+        from torch._dynamo.precompile_context import PrecompileContext
+
         cache_entry = package.cache_entry()
-        pickled_result = pickle.dumps(cache_entry)
-        PrecompileContext.record_artifact(
-            _DynamoCacheArtifact.type(), key=package.source_id, content=pickled_result
+        PrecompileContext.record_dynamo_cache_entry(
+            cache_entry=cache_entry, key=package.source_id
         )
 
     def record_eager_backend(self, backend_id: _BackendId, backend: Any) -> None:
         """
         Records eager fx graphs to PrecompileContext for testing purposes.
         """
+        from torch._dynamo.precompile_context import (
+            EagerCacheArtifact,
+            PrecompileContext,
+        )
+
         pickled_result = pickle.dumps(backend)
         PrecompileContext.record_artifact(
             EagerCacheArtifact.type(), key=backend_id, content=pickled_result
@@ -757,6 +750,11 @@ class DynamoStore(abc.ABC):
         """
         Saves a package to a given path. Grabs backends from PrecompileContext.
         """
+        from torch._dynamo.precompile_context import (
+            PrecompileCacheArtifact,
+            PrecompileContext,
+        )
+
         backend_content: _Backends = {}
         for backend_id in cache_entry.backend_ids:
             serialized_backend = PrecompileContext.serialize_artifact_by_key(backend_id)
@@ -793,6 +791,8 @@ class DynamoStore(abc.ABC):
     def load_cache_entry(
         self, key: str
     ) -> tuple[_DynamoCacheEntry, dict[_BackendId, Any]]:
+        from torch._dynamo.precompile_context import PrecompileContext
+
         cache_entry, backend_content = self.read(key)
         for backend_id, backend in backend_content.items():
             PrecompileContext.record_artifact(
@@ -947,6 +947,12 @@ class DiskDynamoCache(DiskDynamoStore):
             package = CompilePackage(fn, entry)
             package.install(backends)
             return package
+
+
+def cache_dir() -> str:
+    from torch._inductor.runtime.cache_dir_utils import cache_dir
+
+    return cache_dir()
 
 
 DynamoCache = DiskDynamoCache(os.path.join(cache_dir(), "dynamo"))
